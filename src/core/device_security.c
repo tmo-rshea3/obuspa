@@ -194,8 +194,11 @@ static char *fp_output_args[] =
 void LoadCerts_FromPath(char *path, cert_usage_t cert_usage, int role_instance);
 void LoadCerts_FromFile(char *file_path, cert_usage_t cert_usage, int role_instance);
 void LoadCerts_FromDir(char *dir_path, cert_usage_t cert_usage, int role_instance);
+#ifndef REMOVE_DEVICE_SECURITY_CERTIFICATE
 int Get_NumCerts(dm_req_t *req, char *buf, int len);
+#endif
 int Get_NumTrustCerts(dm_req_t *req, char *buf, int len);
+#ifndef REMOVE_DEVICE_SECURITY_CERTIFICATE
 int GetCert_LastModif(dm_req_t *req, char *buf, int len);
 int GetCert_SerialNumber(dm_req_t *req, char *buf, int len);
 int GetCert_Issuer(dm_req_t *req, char *buf, int len);
@@ -204,6 +207,7 @@ int GetCert_NotAfter(dm_req_t *req, char *buf, int len);
 int GetCert_Subject(dm_req_t *req, char *buf, int len);
 int GetCert_SubjectAlt(dm_req_t *req, char *buf, int len);
 int GetCert_SignatureAlgorithm(dm_req_t *req, char *buf, int len);
+#endif
 int GetLaCert_SerialNumber(dm_req_t *req, char *buf, int len);
 int GetLaCert_Issuer(dm_req_t *req, char *buf, int len);
 cert_t *Find_SecurityCertByReq(dm_req_t *req);
@@ -251,6 +255,7 @@ int DEVICE_SECURITY_Init(void)
     int err = USP_ERR_OK;
 
     // Register Device.Security.Certificate parameters
+#ifndef REMOVE_DEVICE_SECURITY_CERTIFICATE
     err |= USP_REGISTER_VendorParam_ReadOnly("Device.Security.CertificateNumberOfEntries", Get_NumCerts, DM_UINT);
     err |= USP_REGISTER_Object(DEVICE_CERT_ROOT ".{i}", USP_HOOK_DenyAddInstance, NULL, NULL,   // This table is read only
                                                         USP_HOOK_DenyDeleteInstance, NULL, NULL);
@@ -262,6 +267,7 @@ int DEVICE_SECURITY_Init(void)
     err |= USP_REGISTER_VendorParam_ReadOnly(DEVICE_CERT_ROOT ".{i}.Subject", GetCert_Subject, DM_STRING);
     err |= USP_REGISTER_VendorParam_ReadOnly(DEVICE_CERT_ROOT ".{i}.SubjectAlt", GetCert_SubjectAlt, DM_STRING);
     err |= USP_REGISTER_VendorParam_ReadOnly(DEVICE_CERT_ROOT ".{i}.SignatureAlgorithm", GetCert_SignatureAlgorithm, DM_STRING);
+#endif
 
     // Register Device.LocalAgent.Certificate parameters
     err |= USP_REGISTER_Object(DEVICE_LA_CERT_ROOT ".{i}", USP_HOOK_DenyAddInstance, NULL, NULL,   // This table is read only
@@ -281,7 +287,9 @@ int DEVICE_SECURITY_Init(void)
     // Register unique keys for tables
     char *unique_keys[] = { "SerialNumber", "Issuer" };
     char *alias_unique_key[] = { "Alias" };
+#ifndef REMOVE_DEVICE_SECURITY_CERTIFICATE
     err |= USP_REGISTER_Object_UniqueKey(DEVICE_CERT_ROOT ".{i}", unique_keys, NUM_ELEM(unique_keys));
+#endif
     err |= USP_REGISTER_Object_UniqueKey(DEVICE_LA_CERT_ROOT ".{i}", unique_keys, NUM_ELEM(unique_keys));
     err |= USP_REGISTER_Object_UniqueKey(DEVICE_LA_CERT_ROOT ".{i}", alias_unique_key, NUM_ELEM(alias_unique_key));
 
@@ -1689,6 +1697,7 @@ int AddClientCert(SSL_CTX *ctx)
     return USP_ERR_OK;
 }
 
+#ifndef REMOVE_DEVICE_SECURITY_CERTIFICATE
 /*********************************************************************//**
 **
 ** Get_NumCerts
@@ -1899,6 +1908,7 @@ int GetCert_SignatureAlgorithm(dm_req_t *req, char *buf, int len)
     USP_SNPRINTF(buf, len, "%s", ct->signature_algorithm);
     return USP_ERR_OK;
 }
+#endif
 
 /*********************************************************************//**
 **
@@ -3121,4 +3131,3 @@ int Operate_GetFingerprint(dm_req_t *req, char *command_key, kv_vector_t *input_
 }
 
 #endif // REMOVE_DEVICE_SECURITY
-

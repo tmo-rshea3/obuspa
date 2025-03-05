@@ -137,6 +137,7 @@
 //#define REMOVE_DEVICE_SCHEDULE_TIMER     // Removes Device.ScheduleTimer() from the core data model
 //#define REMOVE_DEVICE_BOOT_EVENT         // Removes Device.Boot! from the core data model
 //#define REMOVE_DEVICE_SECURITY           // Removes Device.Security, Device.LocalAgent.Certificate and ControllerTrust Challenge/Response mechanism
+//#define REMOVE_DEVICE_SECURITY_CERTIFICATE    // Removes Device.Security.Certificate from the core data model
 //#define REMOVE_SELF_TEST_DIAG_EXAMPLE    // Removes Self Test diagnostics example code
 
 //#define DONT_SORT_GET_INSTANCES          // Disables the sorting of data model paths returned in a GetInstancesResponse. Useful for slow devices supporting large data models.
