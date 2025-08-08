@@ -1,6 +1,7 @@
 /*
  *
- * Copyright (C) 2023-2024, Broadband Forum
+ * Copyright (C) 2023-2025, Broadband Forum
+ * Copyright (C) 2024-2025, Vantiva Technologies SAS
  * Copyright (C) 2023-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
@@ -265,3 +266,4 @@ group_del_entry_t *GROUP_DEL_VECTOR_FindFirstFailureIfAllFailed(group_del_vector
     // Only if all of the objects failed to delete should a failure be indicated
     return first_failure;
 }
+

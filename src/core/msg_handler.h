@@ -1,6 +1,7 @@
 /*
  *
- * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2019-2025, Broadband Forum
+ * Copyright (C) 2024-2025, Vantiva Technologies SAS
  * Copyright (C) 2016-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
@@ -121,6 +122,7 @@ Usp__Msg *MSG_HANDLER_CreateRegisterReq(char *msg_id, char **paths, int num_path
 Usp__Msg *MSG_HANDLER_CreateRequestMsg(char *msg_id, Usp__Header__MsgType header_type, Usp__Request__ReqTypeCase req_type);
 Usp__Msg *MSG_HANDLER_CreateResponseMsg(char *msg_id, Usp__Header__MsgType header_type, Usp__Response__RespTypeCase resp_type);
 Usp__Msg *MSG_HANDLER_CreateUspMsg(char *msg_id, Usp__Header__MsgType header_type, Usp__Body__MsgBodyCase body_type);
+bool MSG_HANDLER_ShouldDropFailedMessage(mtp_send_item_t *item, char *cause);
 
 // Error response
 Usp__Msg *ERROR_RESP_CreateSingle(char *msg_id, int err_code, Usp__Msg *src_msg);

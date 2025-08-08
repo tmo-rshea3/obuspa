@@ -1,6 +1,7 @@
 /*
  *
- * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2019-2025, Broadband Forum
+ * Copyright (C) 2024-2025, Vantiva Technologies SAS
  * Copyright (C) 2016-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
@@ -51,6 +52,8 @@
 #include "device.h"
 #include "dm_inst_vector.h"
 #include "vendor_api.h"
+#include "text_utils.h"
+#include "se_cache.h"
 
 
 
@@ -142,11 +145,13 @@ void DM_TRANS_Add(dm_op_t op, char *path, char *value, dm_val_union_t *val_union
     int new_num_entries;
     dm_trans_t *dt;
     int i;
+    bool is_part_of_add;
 
     USP_ASSERT(cur_transaction != NULL);
 
-    // Do not add set operations, if they are part of a larger add operation - we only want to notify the add
+    // Determine whether the set operation was part of a larger add operation - we only want to notify the add
     // NOTE: When processing a USP AddRequest message, default values are not added to the transaction, only the overridden default values (in the USP AddRequest message)
+    is_part_of_add = false;
     if (op == kDMOp_Set)
     {
         // Iterate over all operations, seeing if any were an add operation
@@ -157,11 +162,12 @@ void DM_TRANS_Add(dm_op_t op, char *path, char *value, dm_val_union_t *val_union
             {
                 if (inst->order >= dt->inst.order)
                 {
-                    // If this set is for a parameter whose parent instances match that of the add, then do not add to transaction
+                    // If this set is for a parameter whose parent instances match that of the add, then it was part of a larger add operation
                     if ( (memcmp(inst->nodes, dt->node->instance_nodes, (dt->inst.order)*sizeof(dm_node_t *)) == 0) &&
                          (memcmp(inst->instances, dt->inst.instances, (dt->inst.order)*sizeof(int)) == 0) )
                     {
-                        return;
+                        is_part_of_add = true;
+                        break;
                     }
                 }
             }
@@ -177,6 +183,7 @@ void DM_TRANS_Add(dm_op_t op, char *path, char *value, dm_val_union_t *val_union
     dt->op = op;
     dt->path = USP_STRDUP(path);
     dt->node = node;
+    dt->is_part_of_add = is_part_of_add;
     memcpy(&dt->inst, inst, sizeof(dm_req_instances_t));
 
     // Save a copy of the value (if applicable to the operation being stored)
@@ -220,6 +227,12 @@ int DM_TRANS_Commit(void)
     dm_trans_vector_t *trans;
     dm_trans_vector_t cascade_trans;
     dm_vendor_commit_trans_cb_t   commit_trans_cb;
+    dm_node_t *node;
+    dm_notify_set_cb_t notify_set_cb;
+    dm_notify_add_cb_t notify_add_cb;
+    dm_notify_add_cb_t notify_del_cb;
+    dm_req_t req;
+    dm_trans_t *dt;
 
     USP_ASSERT(cur_transaction != NULL);
 
@@ -263,14 +276,6 @@ int DM_TRANS_Commit(void)
     // Call the notify function for all operations
     for (i=0; i < trans->num_entries; i++)
     {
-        // Declare local variables here, so that they are not filling up the stack if this function is called recursively
-        dm_node_t *node;
-        dm_notify_set_cb_t notify_set_cb;
-        dm_notify_add_cb_t notify_add_cb;
-        dm_notify_add_cb_t notify_del_cb;
-        dm_req_t req;
-        dm_trans_t *dt;
-
         dt = &trans->vector[i];
         node = dt->node;
 
@@ -280,12 +285,15 @@ int DM_TRANS_Commit(void)
         {
             case kDMOp_Set:
                 // Internal notify callback
-                notify_set_cb = node->registered.param_info.notify_set_cb;
-                if (notify_set_cb != NULL)
+                if (dt->is_part_of_add == false)
                 {
-                    DM_PRIV_RequestInit(&req, node, dt->path, (dm_instances_t *) &dt->inst);
-                    req.val_union = dt->val_union;
-                    err = notify_set_cb(&req, dt->value);
+                    notify_set_cb = node->registered.param_info.notify_set_cb;
+                    if (notify_set_cb != NULL)
+                    {
+                        DM_PRIV_RequestInit(&req, node, dt->path, (dm_instances_t *) &dt->inst);
+                        req.val_union = dt->val_union;
+                        err = notify_set_cb(&req, dt->value);
+                    }
                 }
                 break;
 
@@ -313,6 +321,9 @@ int DM_TRANS_Commit(void)
 
                 // Notify external controllers
                 DEVICE_SUBSCRIPTION_NotifyObjectLifeEvent(dt->path, kSubNotifyType_ObjectDeletion);
+
+                // Update SE based permissions which previously matched this instance
+                SE_CACHE_NotifyInstanceDeleted(dt->path);
                 break;
 
             default:
@@ -449,6 +460,37 @@ bool DM_TRANS_IsWithinTransaction(void)
     return false;
 }
 
+/*********************************************************************//**
+**
+** DM_TRANS_GetParamWritesByPathSpec
+**
+** Returns a list of all parameters written in a transaction (matching a specified spec), pending being committed
+**
+** \param   path_spec - specification of the path to match (can contain, wildcards, instance number or partial path)
+** \param   kvv - pointer to key-value vector in which to return the list of parameters which match (and their values)
+**
+** \return  None
+**
+**************************************************************************/
+void DM_TRANS_GetParamWritesByPathSpec(char *path_spec, kv_vector_t *kvv)
+{
+    int i;
+    dm_trans_t *dt;
+    bool is_match;
+
+    for (i=0; i < cur_transaction->num_entries; i++)
+    {
+        dt = &cur_transaction->vector[i];
+        if (dt->op == kDMOp_Set)
+        {
+            is_match = TEXT_UTILS_IsPathMatch(dt->path, path_spec);
+            if (is_match)
+            {
+                KV_VECTOR_Add(kvv, dt->path, dt->value);
+            }
+        }
+    }
+}
 
 /*********************************************************************//**
 **

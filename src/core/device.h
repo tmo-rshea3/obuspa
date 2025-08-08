@@ -1,6 +1,7 @@
 /*
  *
- * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2019-2025, Broadband Forum
+ * Copyright (C) 2024-2025, Vantiva Technologies SAS
  * Copyright (C) 2016-2024  CommScope, Inc
  * Copyright (C) 2020, BT PLC
  *
@@ -73,6 +74,8 @@ typedef struct
 {
     int inherited_index;      // index of the role in roles[] and in node->permissions[] for the inherited role
     int assigned_index;       // index of the role in roles[] and in node->permissions[] for the assigned role
+                              // IMPORTANT: These are not the same as the instance number (minus 1) in Device.LocalAgent.ControllerTrust.Role.{i},
+                              //            as we support non-contiguous instance numbers for role (but only up to a maximum of MAX_CTRUST_ROLES distinct instances)
 } combined_role_t;
 
 #define INTERNAL_ROLE             NULL   // Pointer to combined role used internally by Data Model. This always permits all operations (Even at bootup, when the permissions table has not been seeded yet)
@@ -89,6 +92,7 @@ typedef struct
 typedef struct
 {
     char *cause;                     // cause of the last reboot
+    char *reason;                    // Reason for the last reboot
     char *command_key;               // command_key associated with the last reboot
     char *cur_software_version;      // Current software version that is running
     char *last_software_version;     // Software version before the current boot period
@@ -193,6 +197,11 @@ typedef struct
 } mtp_conn_t;
 
 //------------------------------------------------------------------------------
+// Define for the which_controller argument of DEVICE_SUBSCRIPTION_ProcessAllEventCompleteSubscriptions() to denote that
+// we should send the event to all controllers which have enabled subscriptions
+#define ALL_CONTROLLERS   (-1)
+
+//------------------------------------------------------------------------------
 // Data model components API
 #ifndef REMOVE_DEVICE_TIME
 int DEVICE_TIME_Init(void);
@@ -201,7 +210,7 @@ int DEVICE_TIME_Start(void);
 int DEVICE_LOCAL_AGENT_Init(void);
 int DEVICE_LOCAL_AGENT_SetDefaults(void);
 int DEVICE_LOCAL_AGENT_Start(void);
-int DEVICE_LOCAL_AGENT_ScheduleReboot(exit_action_t exit_action, char *reboot_cause, char *command_key, int request_instance);
+int DEVICE_LOCAL_AGENT_ScheduleReboot(exit_action_t exit_action, char *reboot_cause, char *reboot_reason, char *command_key, int request_instance);
 exit_action_t DEVICE_LOCAL_AGENT_GetExitAction(void);
 int DEVICE_LOCAL_AGENT_SetDefaultRebootCause(void);
 char *DEVICE_LOCAL_AGENT_GetEndpointID(void);
@@ -263,7 +272,7 @@ void DEVICE_SUBSCRIPTION_ResolveObjectCreationPaths(void);
 void DEVICE_SUBSCRIPTION_ResolveObjectDeletionPaths(void);
 void DEVICE_SUBSCRIPTION_NotifyObjectLifeEvent(char *obj_path, subs_notify_t notify_type);
 void DEVICE_SUBSCRIPTION_ProcessAllObjectLifeEventSubscriptions(void);
-void DEVICE_SUBSCRIPTION_ProcessAllEventCompleteSubscriptions(char *event_name, kv_vector_t *output_args);
+void DEVICE_SUBSCRIPTION_ProcessAllEventCompleteSubscriptions(char *event_name, kv_vector_t *output_args, int which_controller);
 void DEVICE_SUBSCRIPTION_SendPeriodicEvent(int cont_instance);
 void DEVICE_SUBSCRIPTION_NotifyControllerDeleted(int cont_instance);
 int DEVICE_SUBSCRIPTION_GetControllerInstance(int instance);
@@ -298,8 +307,11 @@ int DEVICE_CTRUST_GetCertInheritedRole(int cert_instance);
 int DEVICE_CTRUST_RoleInstanceToIndex(int role_instance);
 int DEVICE_CTRUST_RoleIndexToInstance(int role_index);
 void DEVICE_CTRUST_ApplyPermissionsToSubTree(char *path);
+int DEVICE_CTRUST_InstSelToRoleInstance(void *sel, int *perm_instance);
+char *DEVICE_CTRUST_InstSelToPermTarget(int role_index, void *is, int *perm_instance);
 int DEVICE_CTRUST_SetRoleParameter(int instance, char *param_name, char *new_value);
 int DEVICE_CTRUST_SetPermissionParameter(int instance1, int instance2, char *param_name, char *new_value);
+int DEVICE_CTRUST_DumpPermissionSelectors(int role_instance, char *path);
 int DEVICE_REQUEST_Init(void);
 int DEVICE_REQUEST_Add(char *path, char *command_key, int *instance);
 void DEVICE_REQUEST_OperationComplete(int instance, int err_code, char *err_msg, kv_vector_t *output_args);
@@ -312,6 +324,7 @@ int DEVICE_BULKDATA_Init(void);
 int DEVICE_BULKDATA_Start(void);
 void DEVICE_BULKDATA_Stop(void);
 void DEVICE_BULKDATA_NotifyTransferResult(int profile_id, bdc_transfer_result_t transfer_result);
+void DEVICE_BULKDATA_NotifyControllerDeleted(int cont_instance);
 #ifndef REMOVE_SELF_TEST_DIAG_EXAMPLE
 int DEVICE_SELF_TEST_Init(void);
 #endif
@@ -354,6 +367,12 @@ void DEVICE_CONTROLLER_AddController_UDS(char *endpoint_id, int uds_instance);
 #ifndef REMOVE_USP_SERVICE
 char *DEVICE_CONTROLLER_FindFirstControllerEndpoint(void);
 #endif
+
+// Uncomment the following line to enable cross checking between structures in device_ctrust and se_cache
+//#define CROSS_CHECK_SE_CACHE
+#ifdef CROSS_CHECK_SE_CACHE
+void DEVICE_CTRUST_CrossCheckSECache(void);
+#endif
 //------------------------------------------------------------------------------
 // Tables used to convert to/from an enumeration to/from a string
 extern const enum_entry_t mtp_protocols[kMtpProtocol_Max];
@@ -363,6 +382,10 @@ extern const enum_entry_t mqtt_protocol[kMqttProtocol_Max];
 //------------------------------------------------------------------------------
 // Pointers to strings containing paths in the data model
 extern char *device_req_root;
+
+//-----------------------------------------------------------------------------------------------
+// Help macroer to convert a ControllerTrust permission bit to a character
+#define PERMISSION_CHAR(bitmask, c, mask) ( ((bitmask & mask) == 0) ? '-' : c )
 
 //-----------------------------------------------------------------------------------------------
 // Global variables set by command line

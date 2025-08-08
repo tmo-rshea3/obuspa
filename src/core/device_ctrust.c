@@ -1,6 +1,7 @@
 /*
  *
- * Copyright (C) 2022-2024, Broadband Forum
+ * Copyright (C) 2022-2025, Broadband Forum
+ * Copyright (C) 2024-2025, Vantiva Technologies SAS
  * Copyright (C) 2017-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
@@ -63,7 +64,11 @@
 #include "iso8601.h"
 #include "text_utils.h"
 #include "dm_inst_vector.h"
+#include "inst_sel_vector.h"
 #include "database.h"
+#include "dm_trans.h"
+#include "expr_vector.h"
+#include "se_cache.h"
 
 //------------------------------------------------------------------------------
 // Location of the controller trust tables within the data model
@@ -76,6 +81,13 @@
 static char *device_role_root = "Device.LocalAgent.ControllerTrust.Role";
 
 //------------------------------------------------------------------------------
+// Names of the parameters which are allowed to be in SE based permissions
+// These must be unique keys
+static char *allowed_params_for_se_based_perms_str = ALLOWED_PARAMS_FOR_SE_BASED_PERMS;
+
+str_vector_t allowed_params_for_se_based_perms = { 0 };
+
+//------------------------------------------------------------------------------
 // Structure of an entry in the permissions table in the linked list of a role
 typedef struct
 {
@@ -84,6 +96,7 @@ typedef struct
     bool enable;          // Device.LocalAgent.ControllerTrust.Role.{i}.Permission.{i}.Enable
     unsigned order;       // Device.LocalAgent.ControllerTrust.Role.{i}.Permission.{i}.Order. Higher order permissions override lower order permissions
     str_vector_t targets; // vector of data model paths to apply the permissions to
+    inst_sel_vector_t target_inst_selectors; // Vector containing the instance number selectors for each target. NOTE: values in target_inst_selectors and targets relate by index
     unsigned short permission_bitmask;  // Bitmask of permissions eg PERMIT_GET
 } permission_t;
 
@@ -104,6 +117,10 @@ role_t roles[MAX_CTRUST_ROLES];
 // Vector containing the instance numbers in Device.LocalAgent.ControllerTrust.Role.{i} to update with the new configuration
 // (from the role[] data structure) when the sync timer fires
 int_vector_t roles_to_update = { 0 };
+
+//------------------------------------------------------------------------------
+// Macro to return a modified permission bitmask, disallowing parameter reads, if unable to read the name of the Object in a GSDM (R-GET.1)
+#define MODIFIED_PERM(perm_bitmask)     ((perm_bitmask & PERMIT_OBJ_INFO) == 0) ? (perm_bitmask & ~PERMIT_GET) : perm_bitmask
 
 //------------------------------------------------------------------------------
 // Structure for Credential table
@@ -218,7 +235,8 @@ void ModifyCTrustPermissionNibble(permission_t *perm, char *value, unsigned shor
 void ApplyModifiedPermissions(int id);
 void ScheduleRolePermissionsUpdate(int instance);
 permission_t *FindPermissionByInstance(role_t *role, int instance);
-int ValidatePermTargetsVector(str_vector_t *targets);
+int ValidatePermTargetsVector(str_vector_t *targets, inst_sel_vector_t *perm_instances, unsigned short permission_bitmask);
+int ValidateSearchExpressionPermission(str_vector_t *path_segments, char *path, inst_sel_t *sel);
 int ValidatePermOrderUnique(role_t *role, int order, int instance);
 int ValidateRoleNameUnique(char *name, int instance);
 role_t *FindUnusedRole(void);
@@ -228,6 +246,8 @@ credential_t *FindCredentialByCertInstance(int cert_instance);
 int Get_CredentialRole(dm_req_t *req, char *buf, int len);
 int Get_CredentialCertificate(dm_req_t *req, char *buf, int len);
 int Get_CredentialNumEntries(dm_req_t *req, char *buf, int len);
+void ApplySearchExpressionPermissions(char *path, inst_sel_t *sel);
+bool ValidateDataModelPathSegment(char *segment, bool is_last, char *path);
 
 #ifndef REMOVE_DEVICE_SECURITY
 int InitChallengeTable();
@@ -347,6 +367,11 @@ int DEVICE_CTRUST_Init(void)
                         challenge_response_input_args, NUM_ELEM(challenge_response_input_args),
                         NULL, 0);
 #endif
+
+    // Initialise search expression based permissions components
+    TEXT_UTILS_SplitString(allowed_params_for_se_based_perms_str, &allowed_params_for_se_based_perms, ",");
+    SE_CACHE_Init();
+
     // Exit if any errors occurred
     if (err != USP_ERR_OK)
     {
@@ -434,6 +459,16 @@ void DEVICE_CTRUST_Stop(void)
     int i;
     role_t *role;
 
+    // Free up all memory used by the Search Expression cache
+    SE_CACHE_Destroy();
+
+    // Destroy the permission instance selector vector for all nodes in the data model
+    // NOTE: We do not free the entries in the vector, as they are owned by target_inst_selectors and will be freed by FreeRole() below
+    for (i=0; i<MAX_CTRUST_ROLES; i++)
+    {
+        DM_PRIV_ClearPermissionsForRole(NULL, i);
+    }
+
     // Free all roles and their associated permissions
     for (i=0; i<NUM_ELEM(roles); i++)
     {
@@ -457,6 +492,9 @@ void DEVICE_CTRUST_Stop(void)
 
     // Free challenge_table
     USP_SAFE_FREE(challenge_table);
+
+    // Free the names of all parameters which are allowed in SE based permissions
+    STR_VECTOR_Destroy(&allowed_params_for_se_based_perms);
 }
 #endif
 
@@ -621,6 +659,86 @@ int DEVICE_CTRUST_RoleIndexToInstance(int role_index)
 
 /*********************************************************************//**
 **
+** DEVICE_CTRUST_InstSelToRoleInstance
+**
+** Gets the instance number of the role and permission associated with the specified instance selector
+**
+** \param   role_index - index of the role in roles[] that the specified instance selector is associated with
+** \return  perm_instance - pointer to variable in which to return the instance number of the permission in Device.LocalAgent.ControllerTrust.Role.{i}.Permission.{i}
+**
+** \return  Instance number of the role in Device.LocalAgent.ControllerTrust.Role.{i} that had the specified instance selector,
+**          or INVALID if none matched
+**
+**************************************************************************/
+int DEVICE_CTRUST_InstSelToRoleInstance(void *sel, int *perm_instance)
+{
+    int i;
+    char *target;
+
+    // Iterate over all roles in use, seeing if the instnace selector matches any of the permission targets for that role
+    for (i=0; i < MAX_CTRUST_ROLES; i++)
+    {
+        if (roles[i].instance != INVALID)
+        {
+            target = DEVICE_CTRUST_InstSelToPermTarget(i, sel, perm_instance);
+            if (target != NULL)
+            {
+                return roles[i].instance;
+            }
+        }
+    }
+
+    return INVALID;
+}
+
+/*********************************************************************//**
+**
+** DEVICE_CTRUST_InstSelToPermTarget
+**
+** Gets the permission path (target) that is represented by the specified instance selector
+**
+** \param   role_index - index of the role in roles[] that the specified instance selector is associated with
+** \param   is - pointer to an instance selector. NOTE: This is typed as a void pointer to avoid problems with order of including header files
+** \return  perm_instance - pointer to variable in which to return the instance number of the permission in Device.LocalAgent.ControllerTrust.Role.{i}.Permission.{i}
+**
+** \return  target - permission path (target) that is represented by the specified instance selector, or NULL if none was found
+**
+**************************************************************************/
+char *DEVICE_CTRUST_InstSelToPermTarget(int role_index, void *is, int *perm_instance)
+{
+    int i;
+    role_t *role;
+    permission_t *perm;
+
+    USP_ASSERT((role_index >= 0) && (role_index < MAX_CTRUST_ROLES));
+
+    // Iterate over all permissions for the specified role
+    role = &roles[role_index];
+    perm = (permission_t *) role->permissions.head;
+    while (perm != NULL)
+    {
+        USP_ASSERT(perm->target_inst_selectors.num_entries == perm->targets.num_entries);
+
+        // Iterate over all instance selectors owned by this permission
+        for (i=0; i < perm->target_inst_selectors.num_entries; i++)
+        {
+            // Exit if the specified instance selector matches one owned by this permission
+            if (perm->target_inst_selectors.vector[i] == is)
+            {
+                *perm_instance =perm->instance;
+                return perm->targets.vector[i];
+            }
+        }
+
+        perm = (permission_t *) perm->link.next;
+    }
+
+    // If the code gets here, then no match was found
+    return NULL;
+}
+
+/*********************************************************************//**
+**
 ** DEVICE_CTRUST_SetRoleParameter
 **
 ** Ensures that the database contains the specified child parameter of the Role table with the specified value
@@ -715,6 +833,7 @@ void DEVICE_CTRUST_ApplyPermissionsToSubTree(char *path)
     dm_node_t *node;
     dm_node_t *perm_node;
     char *perm_path;
+    inst_sel_t *sel;
 
     // Exit if the path was not present in the data model
     // This could occur if a USP Service registers a path, but then does not return it in the GSDM response
@@ -737,21 +856,25 @@ void DEVICE_CTRUST_ApplyPermissionsToSubTree(char *path)
                 if (perm->enable)
                 {
                     // Iterate over all targets for this permission
+                    USP_ASSERT(perm->targets.num_entries == perm->target_inst_selectors.num_entries);
                     for (j=0; j < perm->targets.num_entries; j++)
                     {
                         perm_path = perm->targets.vector[j];
-                        perm_node =  DM_PRIV_GetNodeFromPath(perm_path, NULL, NULL, DONT_LOG_ERRORS);
+                        perm_node =  DM_PRIV_GetNodeFromPath(perm_path, NULL, NULL, DONT_LOG_ERRORS | SUBSTITUTE_SEARCH_EXPRS);
+                        sel = perm->target_inst_selectors.vector[j];
                         if (perm_node != NULL)  // Node maybe NULL if it relates to a USP Service that hasn't registered yet
                         {
                             if ((perm_node == node) || (DM_PRIV_IsChildNodeOf(node, perm_node)))
                             {
                                 // Case of permission applies to whole of specified subtree
-                                DM_PRIV_ApplyPermissions(node, i, perm->permission_bitmask);
+                                DM_PRIV_AddPermission(node, i, sel);
+                                ApplySearchExpressionPermissions(perm_path, sel);
                             }
                             else if (DM_PRIV_IsChildNodeOf(perm_node, node))
                             {
                                 // Case of permission applies within the subtree
-                                DM_PRIV_ApplyPermissions(perm_node, i, perm->permission_bitmask);
+                                DM_PRIV_AddPermission(perm_node, i, sel);
+                                ApplySearchExpressionPermissions(perm_path, sel);
                             }
                             // NOTE: if neither of these cases apply, then the permission applies outside of the specified subtree, so there's nothing more to do
                         }
@@ -764,11 +887,187 @@ void DEVICE_CTRUST_ApplyPermissionsToSubTree(char *path)
     }
 }
 
+#ifdef CROSS_CHECK_SE_CACHE
+/*********************************************************************//**
+**
+** DEVICE_CTRUST_CrossCheckSECache
+**
+** Checks that the state of the SE cache matches the correct state here, in ctrust
+**
+** \param   None
+**
+** \return  None
+**
+**************************************************************************/
+void DEVICE_CTRUST_CrossCheckSECache(void)
+{
+    int i, j;
+    role_t *role;
+    permission_t *perm;
+    dm_node_t *node;
+    char *path;
+    inst_sel_t *sel;
+    bool expected_watching;
+    char *search_expr;
+
+    // Iterate over all roles
+    for (i=0; i<NUM_ELEM(roles); i++)
+    {
+        role = &roles[i];
+        if (role->instance != INVALID)
+        {
+            // Iterate over all permissions for this role
+            perm = (permission_t *) role->permissions.head;
+            while (perm != NULL)
+            {
+                // Iterate over all targets for this permission
+                USP_ASSERT(perm->targets.num_entries == perm->target_inst_selectors.num_entries);
+                for (j=0; j < perm->targets.num_entries; j++)
+                {
+                    path = perm->targets.vector[j];
+                    sel = perm->target_inst_selectors.vector[j];
+                    node =  DM_PRIV_GetNodeFromPath(path, NULL, NULL, DONT_LOG_ERRORS | SUBSTITUTE_SEARCH_EXPRS);
+
+                    // Determine whether we expect the SE cache to be watching this
+                    expected_watching = false;
+                    search_expr = strchr(path, '[');
+                    if ((search_expr != NULL) && (role->enable == true) && (perm->enable == true) && (node != NULL))
+                    {
+                        expected_watching = true;
+                    }
+
+                    // NOTE: This code does not cope with the case of the parameter in the SE is not present in the data model, and the asserts will fire if you try testing with that case
+                    USP_ASSERT(sel->is_watching == expected_watching);
+                    USP_ASSERT(SE_CACHE_IsWatchingSelector(sel) == sel->is_watching);
+
+                    if (sel->is_watching)
+                    {
+                        USP_ASSERT(sel->order == 1);
+                        USP_ASSERT(sel->selectors[0] != WILDCARD_INSTANCE);
+                    }
+
+                }
+
+                perm = (permission_t *) perm->link.next;
+            }
+        }
+    }
+}
+#endif
+
+/*********************************************************************//**
+**
+** DEVICE_CTRUST_DumpPermissionSelectors
+**
+** Prints out the permission instance selectors on a data model path
+**
+** \param   role_instance - instance number of role in Device.LocalAgent.ControllerTrust.Role.{i}
+** \param   path - data model path of parameter or object to get the permission selectors for
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int DEVICE_CTRUST_DumpPermissionSelectors(int role_instance, char *path)
+{
+    int i;
+    int role_index;
+    dm_node_t *node;
+    inst_sel_vector_t *isv;
+    inst_sel_t *sel;
+    unsigned short perm;
+    int perm_instance;
+    char *perm_target;
+    int instance;
+    int len;
+    char buf[256];
+    dm_node_t *table_node;
+    bool is_stale;
+
+    // Exit if role instance number does not exist
+    role_index = DEVICE_CTRUST_RoleInstanceToIndex(role_instance);
+    if (role_index == INVALID)
+    {
+        USP_DUMP("%s: Role instance number (%d) does not exist\n", __FUNCTION__, role_instance);
+        return USP_ERR_INTERNAL_ERROR;
+    }
+
+    // Exit if unable to find the path in the data model
+    node = DM_PRIV_GetNodeFromPath(path, NULL, NULL, 0);
+    if (node == NULL)
+    {
+        USP_DUMP("%s: Unknown data model path '%s'\n", __FUNCTION__, path);
+        return USP_ERR_INTERNAL_ERROR;
+    }
+
+    // Iterate over all instance selectors, logging them
+    isv = &node->permissions[role_index];
+    for (i=0; i < isv->num_entries; i++)
+    {
+        // Write the instance number of this permission
+        sel = isv->vector[i];
+        perm_target = DEVICE_CTRUST_InstSelToPermTarget(role_index, sel, &perm_instance);
+        USP_ASSERT(perm_target != NULL);
+        len = USP_SNPRINTF(buf, sizeof(buf), "Permission.%d", perm_instance);
+
+        // Write the permissions associated with the instance selector
+        perm = sel->permission_bitmask;
+        len += USP_SNPRINTF(&buf[len], sizeof(buf)-len, "   Param(%c%c-%c) Obj(%c%c-%c) InstantiatedObj(%c%c-%c) CommandEvent(%c-%c%c)",
+                     PERMISSION_CHAR(perm, 'r', PERMIT_GET),
+                     PERMISSION_CHAR(perm, 'w', PERMIT_SET),
+                     PERMISSION_CHAR(perm, 'n', PERMIT_SUBS_VAL_CHANGE),
+
+                     PERMISSION_CHAR(perm, 'r', PERMIT_OBJ_INFO),
+                     PERMISSION_CHAR(perm, 'w', PERMIT_ADD),
+                     PERMISSION_CHAR(perm, 'n', PERMIT_SUBS_OBJ_ADD),
+
+                     PERMISSION_CHAR(perm, 'r', PERMIT_GET_INST),
+                     PERMISSION_CHAR(perm, 'w', PERMIT_DEL),
+                     PERMISSION_CHAR(perm, 'n', PERMIT_SUBS_OBJ_DEL),
+
+                     PERMISSION_CHAR(perm, 'r', PERMIT_CMD_INFO),
+                     PERMISSION_CHAR(perm, 'x', PERMIT_OPER),
+                     PERMISSION_CHAR(perm, 'n', PERMIT_SUBS_EVT_OPER_COMP) );
+
+        // Write the target of the permission
+        len += USP_SNPRINTF(&buf[len], sizeof(buf)-len, "  %s", perm_target);
+
+        // Write the resolved instance number, if this permission contains a search expression
+        // NOTE: The search expression might not be watched if either the table or the param in the SE has not been registered yet
+        if (sel->is_watching)
+        {
+            // Extract resolved instance number for this SE based permission
+            USP_ASSERT(sel->order == 1);
+            instance = sel->selectors[0];
+            USP_ASSERT(instance != WILDCARD_INSTANCE);
+
+            // Determine if the instance number is stale (ie determine if we know that the instance has been deleted)
+            USP_ASSERT(node->order > 0); // Since we cannot have a SE based permission on a node that doesn't have at least one instance number
+            table_node = node->instance_nodes[0];
+            USP_ASSERT(table_node != NULL); // Since we checked the node's order, instance_nodes[0] should be filled in
+            USP_ASSERT(table_node->type == kDMNodeType_Object_MultiInstance); // Since all nodes in instance_nodes[] are tables
+            is_stale = SE_CACHE_IsSelectorInstanceStale(table_node, sel);
+
+            if (instance == UNKNOWN_INSTANCE)
+            {
+                USP_SNPRINTF(&buf[len], sizeof(buf)-len, "   {i}=?");
+            }
+            else
+            {
+                USP_SNPRINTF(&buf[len], sizeof(buf)-len, "   {i}=%d%c", instance, (is_stale) ? '?' : ' ');
+            }
+        }
+
+        USP_DUMP("%s", buf);
+    }
+
+    return USP_ERR_OK;
+}
+
 /*********************************************************************//**
 **
 ** ValidateAdd_CTrustRole
 **
-** Function called to determin e whether it is possible to add another instance to the role table
+** Function called to determine whether it is possible to add another instance to the role table
 **
 ** \param   req - pointer to structure identifying the request
 **
@@ -928,11 +1227,41 @@ int Validate_CTrustRoleName(dm_req_t *req, char *value)
 int Validate_CTrustPermOrder(dm_req_t *req, char *value)
 {
     role_t *role;
+    kv_vector_t uncommitted_params;
+    kv_pair_t *kv;
+    int i;
+    int err;
+    char path_spec[MAX_DM_PATH];
 
     role = FindRoleByInstance(inst1);
     USP_ASSERT(role != NULL);
 
-    return ValidatePermOrderUnique(role, val_uint, inst2);
+    // Exit if this order is not unique amongst permissions which have successfully committed to the database
+    err = ValidatePermOrderUnique(role, val_uint, inst2);
+    if (err != USP_ERR_OK)
+    {
+        return err;
+    }
+
+    // Get a list of 'Order' parameters which have been set but not yet committed to the database (for this role)
+    KV_VECTOR_Init(&uncommitted_params);
+    USP_SNPRINTF(path_spec, sizeof(path_spec), "%s.%d.Permission.*.Order", device_role_root, inst1);
+    DM_TRANS_GetParamWritesByPathSpec(path_spec, &uncommitted_params);
+
+    // Exit if any of the uncommitted 'Order' parameters match the order which we're validating for uniqueness
+    for (i=0; i < uncommitted_params.num_entries; i++)
+    {
+        kv = &uncommitted_params.vector[i];
+        if (strcmp(kv->value, value)==0)
+        {
+            USP_ERR_SetMessage("%s: Order(%s) not unique (already used by %s)", __FUNCTION__, value, kv->key);
+            KV_VECTOR_Destroy(&uncommitted_params);
+            return USP_ERR_INVALID_ARGUMENTS;
+        }
+    }
+
+    KV_VECTOR_Destroy(&uncommitted_params);
+    return USP_ERR_OK;
 }
 
 /*********************************************************************//**
@@ -950,15 +1279,13 @@ int Validate_CTrustPermOrder(dm_req_t *req, char *value)
 int Validate_CTrustPermTargets(dm_req_t *req, char *value)
 {
     int err;
-
-    // Exit if the permission targets are not a comma separated list with each list item starting 'Device.'
     str_vector_t targets;
 
     // Split the comma separated list of targets into a vector of targets
     STR_VECTOR_Init(&targets);
     TEXT_UTILS_SplitString(value, &targets, ",");
 
-    err = ValidatePermTargetsVector(&targets);
+    err = ValidatePermTargetsVector(&targets, NULL, 0);  // NOTE: We don't care about the pemission bitmask to use, because it is only used in isv, which we aren't getting
 
     STR_VECTOR_Destroy(&targets);
 
@@ -1145,6 +1472,7 @@ int Notify_CTrustPermTargets(dm_req_t *req, char *value)
 {
     role_t *role;
     permission_t *perm;
+    int err;
 
     role = FindRoleByInstance(inst1);
     USP_ASSERT(role != NULL);
@@ -1154,6 +1482,10 @@ int Notify_CTrustPermTargets(dm_req_t *req, char *value)
 
     STR_VECTOR_Destroy(&perm->targets);
     TEXT_UTILS_SplitString(value, &perm->targets, ",");
+
+    // Extract the instance selectors from the targets
+    err = ValidatePermTargetsVector(&perm->targets, &perm->target_inst_selectors, perm->permission_bitmask);
+    USP_ASSERT(err == USP_ERR_OK);      // Since the targets were already checked during the validate phase
 
     ScheduleRolePermissionsUpdate(inst1);
 
@@ -1372,6 +1704,7 @@ int Process_CTrustPermAdded(role_t *role, int perm_instance)
     memset(perm, 0, sizeof(permission_t));
     perm->instance = perm_instance;
     STR_VECTOR_Init(&perm->targets);
+    INST_SEL_VECTOR_Init(&perm->target_inst_selectors);
 
     // Exit if unable to get the Enable for this Permission
     USP_SNPRINTF(path, sizeof(path), "%s.%d.Permission.%d.Enable", device_role_root, role->instance, perm_instance);
@@ -1396,6 +1729,16 @@ int Process_CTrustPermAdded(role_t *role, int perm_instance)
         goto exit;
     }
 
+    // Exit if unable to extract the permissions associated with this instance
+    err  = ExtractPermissions(role, perm, "Param", PERMIT_GET, PERMIT_SET, PERMIT_NONE, PERMIT_SUBS_VAL_CHANGE);
+    err |= ExtractPermissions(role, perm, "Obj",   PERMIT_OBJ_INFO, PERMIT_ADD, PERMIT_NONE, PERMIT_SUBS_OBJ_ADD);
+    err |= ExtractPermissions(role, perm, "InstantiatedObj", PERMIT_GET_INST, PERMIT_DEL, PERMIT_NONE, PERMIT_SUBS_OBJ_DEL);
+    err |= ExtractPermissions(role, perm, "CommandEvent", PERMIT_CMD_INFO, PERMIT_NONE, PERMIT_OPER, PERMIT_SUBS_EVT_OPER_COMP);
+    if (err != USP_ERR_OK)
+    {
+        goto exit;
+    }
+
     // Exit if unable to get the Targets for this Permission
     USP_SNPRINTF(path, sizeof(path), "%s.%d.Permission.%d.Targets", device_role_root, role->instance, perm_instance);
     err = DM_ACCESS_GetStringVector(path, &perm->targets);
@@ -1404,18 +1747,8 @@ int Process_CTrustPermAdded(role_t *role, int perm_instance)
         goto exit;
     }
 
-    // Exit if the targets are not valid
-    err = ValidatePermTargetsVector(&perm->targets);
-    if (err != USP_ERR_OK)
-    {
-        goto exit;
-    }
-
-    // Exit if unable to extract the permissions associated with this instance
-    err  = ExtractPermissions(role, perm, "Param", PERMIT_GET, PERMIT_SET, PERMIT_NONE, PERMIT_SUBS_VAL_CHANGE);
-    err |= ExtractPermissions(role, perm, "Obj",   PERMIT_OBJ_INFO, PERMIT_ADD, PERMIT_NONE, PERMIT_SUBS_OBJ_ADD);
-    err |= ExtractPermissions(role, perm, "InstantiatedObj", PERMIT_GET_INST, PERMIT_DEL, PERMIT_NONE, PERMIT_SUBS_OBJ_DEL);
-    err |= ExtractPermissions(role, perm, "CommandEvent", PERMIT_CMD_INFO, PERMIT_NONE, PERMIT_OPER, PERMIT_SUBS_EVT_OPER_COMP);
+    // Exit if the targets are not valid. If they are valid, extract the instance selectors from the targets
+    err = ValidatePermTargetsVector(&perm->targets, &perm->target_inst_selectors, perm->permission_bitmask);
     if (err != USP_ERR_OK)
     {
         goto exit;
@@ -1430,8 +1763,7 @@ exit:
     else
     {
         // Otherwise free the permission structure
-        STR_VECTOR_Destroy(&perm->targets);
-        USP_FREE(perm);
+        FreePermission(NULL, perm);
     }
 
     return err;
@@ -1473,24 +1805,29 @@ int ValidateRoleNameUnique(char *name, int instance)
 ** ValidatePermTargetsVector
 **
 ** Validates that the targets in the specified string vector look valid and can be supported by this code
+** If they are, then the instance numbers in each target are extracted and added, as an instances selector to isv
 **
 ** \param   targets - vector of data model paths. Either partial paths or wildcarded paths
+** \param   isv - vector in which to store the permission instances of each target. NULL denotes not required).
+** \param   permission_bitmask - bitmask of permissions that applies to all targets. This will be stored in isv if the targets validated
 **
 ** \return  USP_ERR_OK if the targets are valid
 **
 **************************************************************************/
-int ValidatePermTargetsVector(str_vector_t *targets)
+int ValidatePermTargetsVector(str_vector_t *targets, inst_sel_vector_t *isv, unsigned short permission_bitmask)
 {
     int i, j;
-    str_vector_t dm_elements;
+    str_vector_t path_segments;
     char *path;
-    char *element;
+    char *segment;
     char first_char;
-    char c;
     int err;
-    bool is_valid;
+    int items_converted;
+    inst_sel_t *sel = NULL;
+    int instance;
+    bool is_last;
 
-    STR_VECTOR_Init(&dm_elements);
+    STR_VECTOR_Init(&path_segments);
 
     // Exit if there are no targets, this is valid
     if (targets->num_entries == 0)
@@ -1499,81 +1836,359 @@ int ValidatePermTargetsVector(str_vector_t *targets)
         goto exit;
     }
 
+    // Create default permission instances for every target
+    if (isv != NULL)
+    {
+        INST_SEL_VECTOR_Destroy(isv, true);
+        INST_SEL_VECTOR_Fill(isv, targets->num_entries, MODIFIED_PERM(permission_bitmask));
+    }
+
     // Check all of the targets in the vector
     for (i=0; i < targets->num_entries; i++)
     {
-        // Split the target into its data model element constituent parts (separated by '.')
+        // Exit if the path contains reference following
         path = targets->vector[i];
-        TEXT_UTILS_SplitString(path, &dm_elements, ".");
+        if (TEXT_UTILS_StrStr(path, "+") != NULL)
+        {
+            USP_ERR_SetMessage("%s: Reference following not supported in Target '%s'", __FUNCTION__, path);
+            err = USP_ERR_INVALID_ARGUMENTS;
+            goto exit;
+        }
 
-        // Only allow partial paths or wildcarded paths, starting with Device.
-        for (j=0; j < dm_elements.num_entries; j++)
+        // Exit if the path contains ".."
+        if (TEXT_UTILS_StrStr(path, "..") != NULL)
+        {
+            USP_ERR_SetMessage("%s: Target (%s) contains '..'", __FUNCTION__, path);
+            err = USP_ERR_INVALID_ARGUMENTS;
+            goto exit;
+        }
+
+        // Split the target into its data model element constituent parts (separated by '.')
+        TEXT_UTILS_SplitString(path, &path_segments, ".");
+
+        if (isv != NULL)
+        {
+            sel = isv->vector[i];
+        }
+
+        // Iterate over all path segments
+        for (j=0; j < path_segments.num_entries; j++)
         {
             // Exit if the path does not start with 'Device.'
             // NOTE: We cannot just test that the path is present in the data model, because it might be a path for part
             // of the data model owned by a USP Service which has not registered yet
-            element = dm_elements.vector[j];
-            if ((j==0) && (strcmp(element, "Device") != 0))
+            segment = path_segments.vector[j];
+            if ((j==0) && (strcmp(segment, "Device") != 0))
             {
                 USP_ERR_SetMessage("%s: Target '%s' does not start 'Device.'", __FUNCTION__, path);
                 err = USP_ERR_INVALID_ARGUMENTS;
                 goto exit;
             }
 
-            // Skip if this part of the path is a wildcard
-            if (strcmp(element, "*")==0)
+            // Handle search expression, validating the rest of the path too
+            if (*segment == '[')
             {
+                err = ValidateSearchExpressionPermission(&path_segments, path, sel);
+                if (err != USP_ERR_OK)
+                {
+                    goto exit;
+                }
+                goto next_target;
+            }
+
+            // Handle wildcards then skip to next path segment
+            if (strcmp(segment, "*")==0)
+            {
+                if (sel != NULL)
+                {
+                    sel->selectors[sel->order] = WILDCARD_INSTANCE;
+                    sel->order++;
+                }
                 continue;
             }
 
-            // Exit if the path contains a search expression
-            if ((strchr(element, '[') != NULL) || (strchr(element, ']') != NULL))
-            {
-                USP_ERR_SetMessage("%s: Search expressions not supported in Target '%s'", __FUNCTION__, path);
-                err = USP_ERR_INVALID_ARGUMENTS;
-                goto exit;
-            }
-
-            // Exit if the path contains reference following
-            if (strchr(element, '+') != NULL)
-            {
-                USP_ERR_SetMessage("%s: Reference following not supported in Target '%s'", __FUNCTION__, path);
-                err = USP_ERR_INVALID_ARGUMENTS;
-                goto exit;
-            }
-
-            // Exit if the path contains an instance number
-            // NOTE: We only check the first character of the path element, since objects and parameters are allowed to contain numbers in them (just not at the start)
-            first_char = *element;
+            // Handle instance numbers then skip to next path segment
+            // NOTE: We only check the first character of the path segment, since objects and parameters are not allowed to contain numbers in them at the start
+            first_char = *segment;
             if ((first_char >= '0') && (first_char <= '9'))
             {
-                USP_ERR_SetMessage("%s: Instance numbers not supported in Target '%s'", __FUNCTION__, path);
-                err = USP_ERR_INVALID_ARGUMENTS;
-                goto exit;
-            }
-
-            // Exit if the data model element contains any other characters which we weren't expecting in it
-            c = *element++;
-            while (c != '\0')
-            {
-                is_valid = IS_ALPHA_NUMERIC(c) || (c == '_') || (c == '-') || (c == '!') || (c == '(') || (c == ')');
-                if (is_valid == false)
+                items_converted = sscanf(segment, "%d", &instance);
+                if (items_converted != 1)
                 {
-                    USP_ERR_SetMessage("%s: Target '%s' contains invalid character '%c'", __FUNCTION__, path, c);
+                    USP_ERR_SetMessage("%s: Unable to convert instance number '%s'", __FUNCTION__, segment);
                     err = USP_ERR_INVALID_ARGUMENTS;
                     goto exit;
                 }
-                c = *element++;
+
+                if (sel != NULL)
+                {
+                    sel->selectors[sel->order] = instance;
+                    sel->order++;
+                }
+                continue;
+            }
+
+            // If the code gets here, then the path segment must be the name of a DM object, param, command or event
+            // Exit if the data model element contains any other characters which we weren't expecting in it
+            is_last = (j == path_segments.num_entries-1) ? true : false;
+            err = ValidateDataModelPathSegment(segment, is_last, path);
+            if (err != USP_ERR_OK)
+            {
+                goto exit;
             }
         }
-        STR_VECTOR_Destroy(&dm_elements);
+
+next_target:
+        STR_VECTOR_Destroy(&path_segments);
     }
 
     err = USP_ERR_OK;
 
 exit:
-    STR_VECTOR_Destroy(&dm_elements);
+    STR_VECTOR_Destroy(&path_segments);
+
+    if ((err != USP_ERR_OK) && (isv != NULL))
+    {
+        INST_SEL_VECTOR_Destroy(isv, true);
+    }
     return err;
+}
+
+/*********************************************************************//**
+**
+** ValidateSearchExpressionPermission
+**
+** Validates that the specified target contains a search expression only for the first instance number
+** (with no following instance numbers or wildcards in the path). The search expression must contain
+** only Alias or Name parameters.
+**
+** \param   path_segments - Permission target path split into path segments
+** \param   path - Full permission target path (for debug only)
+** \param   sel - pointer to selector to update the instance number with, when it is known (ie later). Or NULL if this is not required (ie case of just validating the path)
+**
+** \return  USP_ERR_OK if the search expression is supported
+**
+**************************************************************************/
+int ValidateSearchExpressionPermission(str_vector_t *path_segments, char *path, inst_sel_t *sel)
+{
+    int i;
+    char *segment;
+    char c;
+    int count = 0;
+    int index = 0;
+    char *search_expr = NULL;
+    char *end;
+    expr_vector_t keys;
+    expr_op_t valid_ops[] = {kExprOp_Equal};
+    char *param;
+    int len;
+    char table[MAX_DM_PATH];
+    int err;
+    dm_instances_t inst;
+    bool is_qualified_instance;
+    dm_node_t *node;
+    dm_node_t *child;
+    bool is_last;
+
+    // Count the number of search expressions, instance numbers and wildcards in the path
+    for (i=0; i < path_segments->num_entries; i++)
+    {
+        segment = path_segments->vector[i];
+        c = *segment;
+        if ((c == '[') || (c == '*') || (IS_NUMERIC(c)))
+        {
+            count++;
+        }
+    }
+
+    // The search expression must represent the first and only instance number in the path
+    // Exit if this is not the case
+    if (count > 1)
+    {
+        USP_ERR_SetMessage("%s: Search expression must represent the only instance number in the path (%s)", __FUNCTION__, path);
+        return USP_ERR_INVALID_ARGUMENTS;
+    }
+
+    // Find the start of the search expression
+    for (i=0; i < path_segments->num_entries; i++)
+    {
+        segment = path_segments->vector[i];
+        if (*segment == '[')
+        {
+            index = i;          // save the index of the path segment containing the search expression for later
+            search_expr = &segment[1];
+            break;
+        }
+    }
+
+    USP_ASSERT(search_expr != NULL);        // Because we know that the loop above is guaranteed to find a search expression
+    USP_ASSERT(index > 0);                  // Because the caller already checked that the first path segment was 'Device.', so the first path segment cannot be a search expression
+
+    // Exit if search expression is not terminated correctly
+    end = TEXT_UTILS_StrStr(search_expr, "]");
+    if ((end == NULL) || (end[1] != '\0'))
+    {
+        USP_ERR_SetMessage("%s: Search expression not terminated correctly (%s)", __FUNCTION__, path);
+        return USP_ERR_INVALID_PATH_SYNTAX;
+    }
+
+    // Validate any segments after the search expression segment
+    for (i=index+1; i < path_segments->num_entries; i++)
+    {
+        segment = path_segments->vector[i];
+        is_last = (i == path_segments->num_entries - 1) ? true : false;
+
+        err = ValidateDataModelPathSegment(segment, is_last, path);
+        if (err != USP_ERR_OK)
+        {
+            return err;
+        }
+    }
+
+    // Exit if an error occurred whilst parsing the key expressions
+    *end = '\0';    // Temporarily truncate the search expression, removing the ']'
+    err = EXPR_VECTOR_SplitExpressions(search_expr, &keys, "&&", valid_ops, NUM_ELEM(valid_ops), EXPR_FROM_USP);
+    *end = ']';     // Restore the ']'
+
+    if (err != USP_ERR_OK)
+    {
+        goto exit;
+    }
+
+    // Exit if no key expressions were found
+    if (keys.num_entries == 0)
+    {
+        USP_ERR_SetMessage("%s: No unique key found in search expression (%s)", __FUNCTION__, path);
+        err = USP_ERR_INVALID_ARGUMENTS;
+        goto exit;
+    }
+
+    // Exit if a compound unique key was given
+    if (keys.num_entries > 1)
+    {
+        USP_ERR_SetMessage("%s: Compound keys not supported in search expression (%s)", __FUNCTION__, path);
+        err = USP_ERR_INVALID_ARGUMENTS;
+        goto exit;
+    }
+
+    // Exit if the key was not one that is supported
+    param = keys.vector[0].param;
+    if (STR_VECTOR_Find(&allowed_params_for_se_based_perms, param) == INVALID)
+    {
+        USP_ERR_SetMessage("%s: Search expression key (%s) is not one of those supported", __FUNCTION__, param);
+        err = USP_ERR_INVALID_ARGUMENTS;
+        goto exit;
+    }
+
+    // Form the name of the table
+    len = 0;
+    for (i=0; i < index; i++)
+    {
+        len += USP_SNPRINTF(&table[len], sizeof(table)-len, "%s.", path_segments->vector[i]);
+    }
+    table[len-1] = '\0';    // Remove trailing '.'
+
+    // Check that if the path exists in the data model, that it is valid
+    node = DM_PRIV_GetNodeFromPath(table, &inst, &is_qualified_instance, DONT_LOG_ERRORS);
+    if (node != NULL)
+    {
+        // Exit if the node is not an unqualified first order multi-instance object
+        if ((node->type != kDMNodeType_Object_MultiInstance) || (is_qualified_instance==true) || (inst.order != 0))
+        {
+            USP_ERR_SetMessage("%s: Path (%s) is not a table object", __FUNCTION__, table);
+            err = USP_ERR_INVALID_ARGUMENTS;
+            goto exit;
+        }
+
+        // Exit if the node does not have a child matching the name of the parameter in the search expression
+        child = DM_PRIV_FindMatchingChild(node, param);
+        if (child == NULL)
+        {
+            USP_ERR_SetMessage("%s: Unique key (%s) does not exist in table (%s)", __FUNCTION__, param, table);
+            err = USP_ERR_INVALID_ARGUMENTS;
+            goto exit;
+        }
+    }
+    else
+    {
+        if (sel != NULL)    // Ensure that this debug is printed out once (as this function is called twice)
+        {
+            USP_LOG_Warning("%s: WARNING: Path (%s) does not exist in the data model", __FUNCTION__, table);
+        }
+    }
+
+    // Initially, set the instance number matching this search expression to unknown. It will be determined later.
+    if (sel != NULL)
+    {
+        sel->order = 1;
+        sel->selectors[0] = UNKNOWN_INSTANCE;
+    }
+    err = USP_ERR_OK;
+
+exit:
+    EXPR_VECTOR_Destroy(&keys);
+    return err;
+}
+
+/*********************************************************************//**
+**
+** ValidateDataModelPathSegment
+**
+** Validates the specified segment of a data model element's path
+** ie Only allowed to contain either ! or (), if it is the last segment in the path
+**
+** \param   segment - string containing a segment of the path (each segment is searated by '.')
+** \param   is_last - boolean specifying whether this is the last segment in the path
+** \param   path - Full path (used for debug message)
+**
+** \return  USP_ERR_OK if the path segment is valid
+**
+**************************************************************************/
+bool ValidateDataModelPathSegment(char *segment, bool is_last, char *path)
+{
+    char c;
+    bool is_valid;
+
+    c = *segment++;
+    while (c != '\0')
+    {
+        if ((IS_ALPHA_NUMERIC(c)) || (c == '_') || (c == '-'))
+        {
+            is_valid = true;
+        }
+        else if (c == '(')
+        {
+            // '()' is only valid at the end of the last segment
+            is_valid = (is_last == true) && (*segment == ')') && (segment[1] == '\0');
+            if (is_valid)
+            {
+                return USP_ERR_OK;
+            }
+        }
+        else if (c == '!')
+        {
+            // '!' is only valid at the end of the last segment
+            is_valid = (is_last == true) && (*segment == '\0');
+            if (is_valid)
+            {
+                return USP_ERR_OK;
+            }
+        }
+        else
+        {
+            is_valid = false;
+        }
+
+        if (is_valid == false)
+        {
+            USP_ERR_SetMessage("%s: Target '%s' contains invalid character '%c'", __FUNCTION__, path, c);
+            return USP_ERR_INVALID_ARGUMENTS;
+        }
+
+        c = *segment++;
+    }
+
+    return USP_ERR_OK;
 }
 
 /*********************************************************************//**
@@ -1582,7 +2197,7 @@ exit:
 **
 ** Validates that the specified permission order is unique for the specified role
 **
-** \param   role - eq - pointer to structure identifying the parameter
+** \param   role - pointer to structure identifying the parameter
 ** \param   order - order of the permission to check
 ** \param   instance - instance number of the permission that is being modified with this new order (not included in uniqueness check)
 **
@@ -1758,13 +2373,14 @@ void ApplyAllPermissionsForRole(role_t *role)
     char *path;
     dm_node_t *node;
     permission_t *perm;
+    inst_sel_t *sel;
     int role_index;
 
     // Calculate the index number of the specified role in the roles[]
     role_index = role - &roles[0];
 
     // Ensure that we start from no permissions applying for this role
-    DM_PRIV_ApplyPermissions(NULL, role_index, PERMIT_NONE);
+    DM_PRIV_ClearPermissionsForRole(NULL, role_index);
 
     // Exit if role is not enabled - nothing more to do
     if ((role->instance == INVALID) || (role->enable == false))
@@ -1783,16 +2399,120 @@ void ApplyAllPermissionsForRole(role_t *role)
             for (i=0; i < perm->targets.num_entries; i++)
             {
                 path = perm->targets.vector[i];
-                node =  DM_PRIV_GetNodeFromPath(path, NULL, NULL, DONT_LOG_ERRORS);
+                sel = perm->target_inst_selectors.vector[i];
+                node =  DM_PRIV_GetNodeFromPath(path, NULL, NULL, DONT_LOG_ERRORS | SUBSTITUTE_SEARCH_EXPRS);
                 if (node != NULL)
                 {
-                    DM_PRIV_ApplyPermissions(node, role_index, perm->permission_bitmask);
+                    DM_PRIV_AddPermission(node, role_index, sel);
+                    ApplySearchExpressionPermissions(path, sel);
+                }
+                else
+                {
+                    // If the selector was previously being watched, but the table doesn't exist now in the data model, remove the watch on it
+                    if (sel->is_watching)
+                    {
+                        SE_CACHE_UnwatchUniqueKey(sel);
+                    }
+                }
+            }
+        }
+        else
+        {
+            // Ensure that all disabled Search expression based permissions are not being watched by the SE cache
+            for (i=0; i < perm->targets.num_entries; i++)
+            {
+                sel = perm->target_inst_selectors.vector[i];
+                if (sel->is_watching)
+                {
+                    SE_CACHE_UnwatchUniqueKey(sel);
                 }
             }
         }
 
         perm = (permission_t *) perm->link.next;
     }
+}
+
+/*********************************************************************//**
+**
+** ApplySearchExpressionPermissions
+**
+** Attempts to resolve the specified search expression based permission, and starts watching for object created/deleted events
+**
+** \param   path - Data model path of the permission target containing a search expression
+** \param   sel - pointer to selector to update the instance number with, when it is known (ie now or later)
+**
+** \return  None
+**
+**************************************************************************/
+void ApplySearchExpressionPermissions(char *path, inst_sel_t *sel)
+{
+    expr_op_t valid_ops[] = {kExprOp_Equal};
+    char *start;
+    char *end;
+    expr_vector_t keys;
+    int err;
+    dm_node_t *node;
+    dm_node_t *child;
+    dm_instances_t inst;
+    bool is_qualified_instance;
+
+    // Exit if this search expression is already being watched
+    if (sel->is_watching)
+    {
+        return;
+    }
+
+    // Exit if this path didn't contain a search expression - nothing more to do
+    start = strchr(path, '[');
+    if (start == NULL)
+    {
+        return;
+    }
+    USP_ASSERT((start > path) && (start[-1] == '.'));  // Code in ValidateSearchExpressionPermission() should have ensured this
+
+    // Find the end of the search expression
+    end = TEXT_UTILS_StrStr(start, "]");
+    USP_ASSERT(end != NULL);       // Code in ValidateSearchExpressionPermission() should have ensured this
+
+    // Extract the search expression key name and value
+    *end = '\0';    // Temporarily truncate the search expression, removing the ']'
+    err = EXPR_VECTOR_SplitExpressions(&start[1], &keys, "&&", valid_ops, NUM_ELEM(valid_ops), EXPR_FROM_USP);
+    USP_ASSERT(err == USP_ERR_OK); // Code in ValidateSearchExpressionPermission() should have ensured this
+    *end = ']';     // Restore the ']'
+    USP_ASSERT(keys.num_entries==1); // Code in ValidateSearchExpressionPermission() should have ensured this
+
+    // Determine the DM node representing this table
+    // NOTE: This should never occur, as the caller has already determined that the permission target exists in the data model, so this table must
+    start[-1] = '\0';   // Temporarily truncate the path, to obtain the name of the table (without trailing dot)
+    node = DM_PRIV_GetNodeFromPath(path, &inst, &is_qualified_instance, 0);
+    start[-1] = '.';    // Restore the '.'
+    USP_ASSERT(node != NULL);
+
+    // Exit if the node is not an unqualified first order multi-instance object
+    // This is possible since we allow permission targets to be set before the data model of a USP Service is registered
+    // In this case, the permission target is invalid, but we have no way of indicating this, so it is treated as if it is disabled
+    if ((node->type != kDMNodeType_Object_MultiInstance) || (is_qualified_instance==true) || (inst.order != 0))
+    {
+        goto exit;
+    }
+
+    // Exit if the node does not have a child matching the name of the parameter in the search expression
+    // Again, this is possible since we allow permission targets to be set before the data model of a USP Service is registered
+    // In this case, the permission target is invalid, but we have no way of indicating this, so it is treated as if it is disabled
+    child = DM_PRIV_FindMatchingChild(node, keys.vector[0].param);
+    if (child == NULL)
+    {
+        goto exit;
+    }
+
+    // Attempt to resolve the search expression, and start watching for instance created/deleted events on the table
+    start[-1] = '\0';   // Temporarily truncate the path, to obtain the name of the table (without trailing dot)
+    SE_CACHE_WatchUniqueKey(node, path, keys.vector[0].param, keys.vector[0].value, sel);
+    start[-1] = '.';    // Restore the '.'
+
+exit:
+    EXPR_VECTOR_Destroy(&keys);
 }
 
 /*********************************************************************//**
@@ -1888,7 +2608,7 @@ void FreeRole(role_t *role)
 **
 ** Frees all memory associated with the specified permission
 **
-** \param   role - pointer to role containing the permission to free
+** \param   role - pointer to role containing the permission to free, or NULL if the permission has not been added to a role yet
 ** \param   perm - pointer to permission to free
 **
 ** \return  USP_ERR_OK if successful
@@ -1897,7 +2617,12 @@ void FreeRole(role_t *role)
 void FreePermission(role_t *role, permission_t *perm)
 {
     STR_VECTOR_Destroy(&perm->targets);
-    DLLIST_Unlink(&role->permissions, perm);
+    INST_SEL_VECTOR_Destroy(&perm->target_inst_selectors, true);
+
+    if (role != NULL)
+    {
+        DLLIST_Unlink(&role->permissions, perm);
+    }
     USP_FREE(perm);
 }
 
@@ -1919,9 +2644,12 @@ void FreePermission(role_t *role, permission_t *perm)
 **************************************************************************/
 int ModifyCTrustPermissionNibbleFromReq(dm_req_t *req, char *value, unsigned short read_perm, unsigned short write_perm, unsigned short exec_perm, unsigned short notify_perm)
 {
+    int i;
     role_t *role;
     permission_t *perm;
+    inst_sel_t *sel;
     unsigned short old_perm_bitmask;
+    unsigned short modified_perm_bitmask;
 
     role = FindRoleByInstance(inst1);
     USP_ASSERT(role != NULL);
@@ -1937,6 +2665,14 @@ int ModifyCTrustPermissionNibbleFromReq(dm_req_t *req, char *value, unsigned sho
     if (perm->permission_bitmask == old_perm_bitmask)
     {
         goto exit;
+    }
+
+    // Update all permissions in the target_inst_selectors vector
+    modified_perm_bitmask = MODIFIED_PERM(perm->permission_bitmask);
+    for (i=0; i < perm->target_inst_selectors.num_entries; i++)
+    {
+        sel = perm->target_inst_selectors.vector[i];
+        sel->permission_bitmask = modified_perm_bitmask;
     }
 
     ScheduleRolePermissionsUpdate(inst1);
@@ -1985,7 +2721,7 @@ void ScheduleRolePermissionsUpdate(int instance)
 **
 ** Applies all modified permissions for the roles indicated by roles_to_update
 ** This function is a sync timer callback, which is called after processing a USP message,
-** and after all permissions modifications have been made to the roles[] data structure by the Notrify_CTrustXXX() functions
+** and after all permissions modifications have been made to the roles[] data structure by the Notify_CTrustXXX() functions
 **
 ** \param   id - (unused) identifier of the sync timer which caused this callback
 **

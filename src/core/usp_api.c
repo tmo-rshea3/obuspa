@@ -1,6 +1,7 @@
 /*
  *
- * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2019-2025, Broadband Forum
+ * Copyright (C) 2024-2025, Vantiva Technologies SAS
  * Copyright (C) 2016-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
@@ -315,7 +316,7 @@ int USP_DM_InformDataModelEvent(char *event_name, kv_vector_t *output_args)
         return USP_ERR_INTERNAL_ERROR;
     }
 
-    DEVICE_SUBSCRIPTION_ProcessAllEventCompleteSubscriptions(event_name, output_args);
+    DEVICE_SUBSCRIPTION_ProcessAllEventCompleteSubscriptions(event_name, output_args, ALL_CONTROLLERS);
 
     return USP_ERR_OK;
 }

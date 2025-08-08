@@ -37,6 +37,7 @@ SOURCES = src/core/main.c \
                     src/core/group_set_vector.c \
                     src/core/group_add_vector.c \
                     src/core/group_del_vector.c \
+                    src/core/inst_sel_vector.c \
                     src/core/proto_trace.c \
                     src/core/data_model.c \
                     src/core/error_resp.c \
@@ -79,6 +80,7 @@ SOURCES = src/core/main.c \
                     src/core/os_utils.c \
                     src/core/device_request.c \
                     src/core/dllist.c \
+                    src/core/se_cache.c \
                     src/libjson/ccan/json/json.c \
                     src/protobuf-c/usp-msg.pb-c.c \
                     src/protobuf-c/usp-record.pb-c.c \

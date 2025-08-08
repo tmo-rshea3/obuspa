@@ -1,6 +1,7 @@
 /*
  *
- * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2019-2025, Broadband Forum
+ * Copyright (C) 2024-2025, Vantiva Technologies SAS
  * Copyright (C) 2016-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
@@ -196,7 +197,7 @@ void EXPR_VECTOR_Destroy(expr_vector_t *ev)
     }
 
     // Free the vector itself
-    USP_FREE(ev->vector);
+    USP_SAFE_FREE(ev->vector);
 
 exit:
     // Ensure structure is re-initialised
@@ -235,7 +236,7 @@ void EXPR_VECTOR_Dump(expr_vector_t *ev)
 ** checking that the operator in the expression matches one of those in a list supplied to this function
 ** NOTE: Substrings are trimmed of whitespace at the start and end
 **
-** \param   str - string containing comma-delimited substrings
+** \param   str - string containing separator-delimited substrings
 ** \param   ev - pointer to vector to return expressions in
 ** \param   separator - pointer to string containing separator of expressions
 ** \param   valid_ops - pointer to array of operators which are accepted in the expression
@@ -281,7 +282,7 @@ int EXPR_VECTOR_SplitExpressions(char *str, expr_vector_t *ev, char *separator, 
         is_accepted = IsOperatorInArray(expr_op, valid_ops, num_valid_ops);
         if (is_accepted == false)
         {
-            USP_ERR_SetMessage("%s: Expression '%s' contains invalid operator '%s'", __FUNCTION__, key_expressions.vector[i], expr_op_2_str[expr_op] );
+            USP_ERR_SetMessage("%s: Expression after '%s' contains invalid or unsupported operator '%s'", __FUNCTION__, key_expressions.vector[i], expr_op_2_str[expr_op] );
             err = USP_ERR_INVALID_PATH_SYNTAX;
             goto exit;
         }
@@ -409,11 +410,15 @@ int ParseExprComponent(char *buf, char **p_relative_path, expr_op_t *p_op, char 
         return USP_ERR_INVALID_PATH_SYNTAX;
     }
 
-    // Exit if the expression constant still contains speech marks
-    if (strchr(expr_const, '\"') != NULL)
+    // Exit if the expression constant still contains speech marks. This is an error according to USP Spec Data Model Path Grammar BNF
+    // However we allow it for CLI initiated USP command and event arguments, as they may contain JSON formatted data
+    if (is_cli_parser == false)
     {
-        USP_ERR_SetMessage("%s: Expression constant '%s' is not valid", __FUNCTION__, expr_const);
-        return USP_ERR_INVALID_PATH_SYNTAX;
+        if (strchr(expr_const, '\"') != NULL)
+        {
+            USP_ERR_SetMessage("%s: Expression constant '%s' is not valid", __FUNCTION__, expr_const);
+            return USP_ERR_INVALID_PATH_SYNTAX;
+        }
     }
 
     // Convert % escaped characters in the expression constant to their equivalent value

@@ -1,8 +1,7 @@
 /*
  *
- * Copyright (C) 2019-2025, Broadband Forum
- * Copyright (C) 2024-2025, Vantiva Technologies SAS
- * Copyright (C) 2008-2024  CommScope, Inc
+ * Copyright (C) 2025, Broadband Forum
+ * Copyright (C) 2025, Vantiva Technologies SAS
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -33,11 +32,34 @@
  *
  */
 
-
 /**
- * @file uri.c
+ * \file se_cache.h
  *
- * Uniform Resource Identifier utilities
+ * Implements and maintains a cache of instance numbers matching a unique key search expression
  *
  */
 
+
+#ifndef SE_CACHE_H
+#define SE_CACHE_H
+
+#include "inst_sel_vector.h"
+
+//-------------------------------------------------------------------------
+// API
+void SE_CACHE_Init(void);
+void SE_CACHE_Destroy(void);
+void SE_CACHE_WatchUniqueKey(dm_node_t *node, char *table, char *param, char *value, inst_sel_t *sel);
+void SE_CACHE_UnwatchUniqueKey(inst_sel_t *sel);
+void SE_CACHE_StartSEResolution(void);
+void SE_CACHE_WatchAllUniqueKeysOnUspService(int group_id);
+void SE_CACHE_NotifyInstanceAdded(char *path, kv_vector_t *keys);
+void SE_CACHE_NotifyInstanceDeleted(char *path);
+void SE_CACHE_RefreshPermissions(dm_node_t *node);
+void SE_CACHE_HandleUspServiceDisconnect(int group_id);
+void SE_CACHE_Dump(void);
+bool SE_CACHE_IsWatchingSelector(inst_sel_t *sel);
+bool SE_CACHE_IsWatchingNode(dm_node_t *node);
+bool SE_CACHE_IsSelectorInstanceStale(dm_node_t *node, inst_sel_t *sel);
+
+#endif

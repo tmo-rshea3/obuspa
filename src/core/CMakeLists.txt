@@ -41,6 +41,7 @@ add_library(core
     group_set_vector.c
     group_add_vector.c
     group_del_vector.c
+    inst_sel_vector.c
     proto_trace.c
     data_model.c
     error_resp.c
@@ -94,6 +95,7 @@ add_library(core
     usp_record.c
     sar_vector.c
     e2e_context.c
+    se_cache.c
     device_uds.c
     uds.c
     plugin.c

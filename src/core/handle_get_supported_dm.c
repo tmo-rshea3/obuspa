@@ -1,6 +1,7 @@
 /*
  *
- * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2019-2025, Broadband Forum
+ * Copyright (C) 2024-2025, Vantiva Technologies SAS
  * Copyright (C) 2016-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
@@ -58,22 +59,27 @@
 #define RETURN_COMMANDS  0x00000002
 #define RETURN_EVENTS    0x00000004
 #define RETURN_PARAMS    0x00000008
+#define RETURN_KEYS      0x00000010
+#define RETURN_ALL       (RETURN_COMMANDS | RETURN_EVENTS | RETURN_PARAMS)
 
 //------------------------------------------------------------------------------
 // Forward declarations. Note these are not static, because we need them in the symbol table for USP_LOG_Callstack() to show them
 void ProcessSupportedPathInstances(char *schema_path, unsigned gs_flags, Usp__GetSupportedDMResp *gs_resp);
 Usp__Msg *CreateGetSupportedDMResp(char *msg_id);
-void WalkSchema(dm_node_t *parent, Usp__GetSupportedDMResp__RequestedObjectResult *ror, unsigned gs_flags, combined_role_t *combined_role);
+void WalkSchema(dm_node_t *parent, Usp__GetSupportedDMResp__RequestedObjectResult *ror, unsigned gs_flags, combined_role_t *combined_role, dm_instances_t *inst);
 Usp__GetSupportedDMResp__RequestedObjectResult *
 AddGetSupportedDM_ReqObjResult(Usp__GetSupportedDMResp *gs_resp, char *requested_path, int err, char *err_msg, char *bbf_uri);
 Usp__GetSupportedDMResp__SupportedObjectResult *
 AddReqObjResult_SupportedObjResult(Usp__GetSupportedDMResp__RequestedObjectResult *ror, dm_node_t *node, unsigned short permissions);
+void AddSupportedObjResult_Child(Usp__GetSupportedDMResp__SupportedObjectResult *sor, dm_node_t *child, unsigned short child_perm, unsigned short parent_perm, unsigned gs_flags);
 void AddSupportedObjResult_SupportedCommandResult(Usp__GetSupportedDMResp__SupportedObjectResult *sor, dm_node_t *node);
 void AddSupportedObjResult_SupportedEventResult(Usp__GetSupportedDMResp__SupportedObjectResult *sor, dm_node_t *node);
 void AddSupportedObjResult_SupportedParamResult(Usp__GetSupportedDMResp__SupportedObjectResult *sor, dm_node_t *node, unsigned short permissions);
 Usp__GetSupportedDMResp__ObjAccessType  CalcDMSchemaObjAccess(bool is_add_allowed, bool is_del_allowed);
 Usp__GetSupportedDMResp__ParamAccessType  CalcDMSchemaParamAccess(bool is_read_allowed, bool is_write_allowed);
 Usp__GetSupportedDMResp__ParamValueType CalcDMSchemaParamType(dm_node_t *node);
+void AddSupportedObjResult_SingleChild(dm_node_t *child, Usp__GetSupportedDMResp__RequestedObjectResult *ror, combined_role_t *combined_role, dm_instances_t *inst);
+void AddSupportedObjResult_SupportedUniqueKeySet(Usp__GetSupportedDMResp__SupportedObjectResult *sor, dm_node_t *node);
 
 /*********************************************************************//**
 **
@@ -114,6 +120,7 @@ void MSG_HANDLER_HandleGetSupportedDM(Usp__Msg *usp, char *controller_endpoint, 
     gs_flags |= (gs->return_commands) ? RETURN_COMMANDS : 0;
     gs_flags |= (gs->return_events) ? RETURN_EVENTS : 0;
     gs_flags |= (gs->return_params) ? RETURN_PARAMS : 0;
+    gs_flags |= (gs->return_unique_key_sets) ? RETURN_KEYS : 0;
 
     // Create a GetSupportedDM Response message
     resp = CreateGetSupportedDMResp(usp->header->msg_id);
@@ -137,7 +144,7 @@ exit:
 ** Process each requested path
 **
 ** \param   schema_path - Data model schema path to query
-** \param   gs_flags - flags controlling which artifacts to put in the response
+** \param   gs_flags - flags controlling which artifacts to put in the response (eg FIRST_LEVEL_ONLY, RETURN_COMMANDS)
 ** \param   gs_resp - pointer to GetSupportedDMResponse object of USP response message
 **
 ** \return  None - This code must handle any errors by reporting errors in the response message
@@ -148,20 +155,12 @@ void ProcessSupportedPathInstances(char *schema_path, unsigned gs_flags, Usp__Ge
     dm_node_t *node;
     Usp__GetSupportedDMResp__RequestedObjectResult *ror;
     combined_role_t combined_role;
+    dm_instances_t inst;
 
     // Exit if unable to find a node matching the specified schema path
-    node = DM_PRIV_GetNodeFromPath(schema_path, NULL, NULL, 0);
+    node = DM_PRIV_GetNodeFromPath(schema_path, &inst, NULL, 0);
     if (node == NULL)
     {
-        ror = AddGetSupportedDM_ReqObjResult(gs_resp, schema_path, USP_ERR_INVALID_PATH, USP_ERR_GetMessage(), BBF_DATA_MODEL_URI);
-        (void)ror; // Keep Clang static analyser happy
-        return;
-    }
-
-    // Exit if node is not an object
-    if (IsObject(node) == false)
-    {
-        USP_ERR_SetMessage("%s: Schema path (%s) does not represent an object", __FUNCTION__, schema_path);
         ror = AddGetSupportedDM_ReqObjResult(gs_resp, schema_path, USP_ERR_INVALID_PATH, USP_ERR_GetMessage(), BBF_DATA_MODEL_URI);
         (void)ror; // Keep Clang static analyser happy
         return;
@@ -174,7 +173,15 @@ void ProcessSupportedPathInstances(char *schema_path, unsigned gs_flags, Usp__Ge
     MSG_HANDLER_GetMsgRole(&combined_role);
 
     // Recurse through the schema, building up the response
-    WalkSchema(node, ror, gs_flags, &combined_role);
+    if (IsObject(node))
+    {
+        // Recurse through the schema, building up the response
+        WalkSchema(node, ror, gs_flags, &combined_role, &inst);
+    }
+    else
+    {
+        AddSupportedObjResult_SingleChild(node, ror, &combined_role, &inst);
+    }
 }
 
 /*********************************************************************//**
@@ -184,14 +191,15 @@ void ProcessSupportedPathInstances(char *schema_path, unsigned gs_flags, Usp__Ge
 ** Function called recursively to add the schema paths of all nodes to a string vector
 **
 ** \param   parent - pointer to data model node representing schema object to add to the response message
-** \param   ror - pointer to the RequestedObjResult object in the response message to add ostring vector in which to add the schema paths
-** \param   gs_flags - flags controlling which artifacts to put in the response
+** \param   ror - pointer to the RequestedObjResult object in the response message to add to
+** \param   gs_flags - flags controlling which artefacts to put in the response (eg FIRST_LEVEL_ONLY, RETURN_COMMANDS)
 ** \param   combined_role - role to use for permissions when walking the schema
+** \param   inst - pointer to instances structure, filled in from parsing the path
 **
 ** \return  None
 **
 **************************************************************************/
-void WalkSchema(dm_node_t *parent, Usp__GetSupportedDMResp__RequestedObjectResult *ror, unsigned gs_flags, combined_role_t *combined_role)
+void WalkSchema(dm_node_t *parent, Usp__GetSupportedDMResp__RequestedObjectResult *ror, unsigned gs_flags, combined_role_t *combined_role, dm_instances_t *inst)
 {
     dm_node_t *child;
     Usp__GetSupportedDMResp__SupportedObjectResult *sor = NULL;
@@ -201,10 +209,14 @@ void WalkSchema(dm_node_t *parent, Usp__GetSupportedDMResp__RequestedObjectResul
     // Add a SupportedObjectResult for this schema object, if the controller is permitted to query its schema
     // NOTE: code that adds to the SupportedObjResult is also guarded by the same test
     USP_ASSERT(IsObject(parent));
-    parent_perm  = DM_PRIV_GetPermissions(parent, combined_role);
+    parent_perm  = DM_PRIV_GetPermissions(parent, inst, combined_role, 0);
     if (parent_perm & PERMIT_OBJ_INFO)
     {
         sor = AddReqObjResult_SupportedObjResult(ror, parent, parent_perm);
+        if (gs_flags & RETURN_KEYS)
+        {
+            AddSupportedObjResult_SupportedUniqueKeySet(sor, parent);
+        }
     }
 
     // Iterate over list of children
@@ -212,20 +224,19 @@ void WalkSchema(dm_node_t *parent, Usp__GetSupportedDMResp__RequestedObjectResul
     while (child != NULL)
     {
         // Get controller's permissions for this child
-        child_perm = DM_PRIV_GetPermissions(child, combined_role);
-
+        child_perm = DM_PRIV_GetPermissions(child, inst, combined_role, 0);
         switch(child->type)
         {
             case kDMNodeType_Object_MultiInstance:
             case kDMNodeType_Object_SingleInstance:
                 if ((gs_flags & FIRST_LEVEL_ONLY)==0)
                 {
-                    WalkSchema(child, ror, gs_flags, combined_role);
+                    WalkSchema(child, ror, gs_flags, combined_role, inst);
                 }
                 else
                 {
                     // FirstLevelOnly==true shows immediate child objects only
-                    child_perm  = DM_PRIV_GetPermissions(parent, combined_role);
+                    child_perm  = DM_PRIV_GetPermissions(parent, inst, combined_role, 0);
                     if (child_perm & PERMIT_OBJ_INFO)
                     {
                         (void)AddReqObjResult_SupportedObjResult(ror, child, child_perm);
@@ -242,29 +253,10 @@ void WalkSchema(dm_node_t *parent, Usp__GetSupportedDMResp__RequestedObjectResul
             case kDMNodeType_DBParam_Secure:
             case kDMNodeType_VendorParam_ReadOnly:
             case kDMNodeType_VendorParam_ReadWrite:
-                if ((gs_flags & RETURN_PARAMS) && (parent_perm & PERMIT_OBJ_INFO))
-                {
-                    AddSupportedObjResult_SupportedParamResult(sor, child, child_perm);
-                }
-                break;
-
             case kDMNodeType_SyncOperation:
             case kDMNodeType_AsyncOperation:
-                if ((gs_flags & RETURN_COMMANDS) &&
-                    (parent_perm & PERMIT_OBJ_INFO) && (parent_perm & PERMIT_CMD_INFO) &&
-                    (child_perm & PERMIT_CMD_INFO))
-                {
-                    AddSupportedObjResult_SupportedCommandResult(sor, child);
-                }
-                break;
-
             case kDMNodeType_Event:
-                if ((gs_flags & RETURN_EVENTS) &&
-                    (parent_perm & PERMIT_OBJ_INFO) && (parent_perm & PERMIT_CMD_INFO) &&
-                    (child_perm & PERMIT_CMD_INFO))
-                {
-                    AddSupportedObjResult_SupportedEventResult(sor, child);
-                }
+                AddSupportedObjResult_Child(sor, child, child_perm, parent_perm, gs_flags);
                 break;
 
             case kDMNodeType_Max:
@@ -351,7 +343,7 @@ AddGetSupportedDM_ReqObjResult(Usp__GetSupportedDMResp *gs_resp, char *requested
 ** Dynamically adds a SupportedObjResult to a RequestedObjResult object
 **
 ** \param   ror - pointer to RequestedObjResult object
-** \param   node - Data model node containing details to add
+** \param   node - Data model node of object to add
 ** \param   permissions - permissions bitmask for the node
 **
 ** \return  Pointer to a SupportedObjResult object
@@ -369,6 +361,8 @@ AddReqObjResult_SupportedObjResult(Usp__GetSupportedDMResp__RequestedObjectResul
 
     #define CAN_ADD 0x01
     #define CAN_DELETE 0x02
+
+    USP_ASSERT(IsObject(node));
 
     // Allocate memory to store the SupportedObjResult object
     sor = USP_MALLOC(sizeof(Usp__GetSupportedDMResp__SupportedObjectResult));
@@ -422,7 +416,7 @@ AddReqObjResult_SupportedObjResult(Usp__GetSupportedDMResp__RequestedObjectResul
         sor->is_multi_instance = false;
     }
 
-    // Set the Access enumeration, based on peroperties calculated above
+    // Set the Access enumeration, based on properties calculated above
     sor->access = CalcDMSchemaObjAccess(is_add_allowed, is_del_allowed);
 
     // Divergent paths are not currently supported, so no divergent object instances to indicate
@@ -430,6 +424,107 @@ AddReqObjResult_SupportedObjResult(Usp__GetSupportedDMResp__RequestedObjectResul
     sor->divergent_paths = NULL;
 
     return sor;
+}
+
+/*********************************************************************//**
+**
+** AddSupportedObjResult_SingleChild
+**
+** Adds a SupportedObjResult containing a single child DM element
+** This function is used when the GSDM requested a specific parameter, command or event, rather than an object
+**
+** \param   child - pointer to data model node representing schema path to add to the response message
+** \param   ror - pointer to the RequestedObjResult object in the response message to add to
+** \param   combined_role - role to use for permissions when walking the schema
+** \param   inst - pointer to instances structure, filled in from parsing the path
+**
+** \return  None
+**
+**************************************************************************/
+void AddSupportedObjResult_SingleChild(dm_node_t *child, Usp__GetSupportedDMResp__RequestedObjectResult *ror, combined_role_t *combined_role, dm_instances_t *inst)
+{
+    dm_node_t *parent;
+    unsigned short parent_perm;
+    unsigned short child_perm;
+    Usp__GetSupportedDMResp__SupportedObjectResult *sor = NULL;
+
+    // Add a SupportedObjectResult for this schema object, if the controller is permitted to query its schema
+    // NOTE: code that adds to the SupportedObjResult is also guarded by the same test
+    parent = child->parent_node;
+    USP_ASSERT(IsObject(parent));
+    parent_perm  = DM_PRIV_GetPermissions(parent, inst, combined_role, 0);
+    if (parent_perm & PERMIT_OBJ_INFO)
+    {
+        sor = AddReqObjResult_SupportedObjResult(ror, parent, parent_perm);
+
+        // Get controller's permissions for the child to add
+        child_perm = DM_PRIV_GetPermissions(child, inst, combined_role, 0);
+        AddSupportedObjResult_Child(sor, child, child_perm, parent_perm, RETURN_ALL);
+    }
+}
+
+/*********************************************************************//**
+**
+** AddSupportedObjResult_Child
+**
+** Dynamically adds a parameter, command or event to a SupportedObjResult object
+**
+** \param   sor - pointer to the SupportedObjResult object
+** \param   child - Data model node containing parameter, command or event to add
+** \param   child_perm - permissions bitmask of the parameter, command or event to add
+** \param   parent_perm - permissions bitmask of the parent object of the parameter, command or event to add
+** \param   gs_flags - flags controlling which artefacts to put in the response (eg FIRST_LEVEL_ONLY, RETURN_COMMANDS)
+**
+** \return  None
+**
+**************************************************************************/
+void AddSupportedObjResult_Child(Usp__GetSupportedDMResp__SupportedObjectResult *sor, dm_node_t *child, unsigned short child_perm, unsigned short parent_perm, unsigned gs_flags)
+{
+    switch(child->type)
+    {
+        case kDMNodeType_Param_ConstantValue:
+        case kDMNodeType_Param_NumEntries:
+        case kDMNodeType_DBParam_ReadWrite:
+        case kDMNodeType_DBParam_ReadOnly:
+        case kDMNodeType_DBParam_ReadOnlyAuto:
+        case kDMNodeType_DBParam_ReadWriteAuto:
+        case kDMNodeType_DBParam_Secure:
+        case kDMNodeType_VendorParam_ReadOnly:
+        case kDMNodeType_VendorParam_ReadWrite:
+            if ((gs_flags & RETURN_PARAMS) &&
+                (parent_perm & PERMIT_OBJ_INFO) && (parent_perm & PERMIT_PARAM_INFO) &&
+                (child_perm & PERMIT_PARAM_INFO))
+            {
+                AddSupportedObjResult_SupportedParamResult(sor, child, child_perm);
+            }
+            break;
+
+        case kDMNodeType_SyncOperation:
+        case kDMNodeType_AsyncOperation:
+            if ((gs_flags & RETURN_COMMANDS) &&
+                (parent_perm & PERMIT_OBJ_INFO) && (parent_perm & PERMIT_CMD_INFO) &&
+                (child_perm & PERMIT_CMD_INFO))
+            {
+                AddSupportedObjResult_SupportedCommandResult(sor, child);
+            }
+            break;
+
+        case kDMNodeType_Event:
+            if ((gs_flags & RETURN_EVENTS) &&
+                (parent_perm & PERMIT_OBJ_INFO) && (parent_perm & PERMIT_CMD_INFO) &&
+                (child_perm & PERMIT_CMD_INFO))
+            {
+                AddSupportedObjResult_SupportedEventResult(sor, child);
+            }
+            break;
+
+        case kDMNodeType_Object_MultiInstance:
+        case kDMNodeType_Object_SingleInstance:
+        case kDMNodeType_Max:
+        default:
+            TERMINATE_BAD_CASE(child->type);
+            break;
+    }
 }
 
 /*********************************************************************//**
@@ -621,6 +716,79 @@ void AddSupportedObjResult_SupportedParamResult(Usp__GetSupportedDMResp__Support
     pr->access = CalcDMSchemaParamAccess(is_read_allowed, is_write_allowed);
     pr->value_type = CalcDMSchemaParamType(node);
     pr->value_change = (node->registered.param_info.type_flags & DM_VALUE_CHANGE_WILL_IGNORE) ? USP__GET_SUPPORTED_DMRESP__VALUE_CHANGE_TYPE__VALUE_CHANGE_WILL_IGNORE : USP__GET_SUPPORTED_DMRESP__VALUE_CHANGE_TYPE__VALUE_CHANGE_ALLOWED;
+}
+
+/*********************************************************************//**
+**
+** AddSupportedObjResult_SupportedUniqueKeySet
+**
+** Dynamically adds a SupportedUniqueKeySet to a SupportedObjResult object
+**
+** \param   sor - pointer to the SupportedObjResult object
+** \param   node - Data model node of object whose unique keys we wish to add
+**
+** \return  None
+**
+**************************************************************************/
+void AddSupportedObjResult_SupportedUniqueKeySet(Usp__GetSupportedDMResp__SupportedObjectResult *sor, dm_node_t *node)
+{
+    int i, j;
+    dm_unique_key_vector_t *unique_keys;
+    int num_sets;
+    Usp__GetSupportedDMResp__SupportedUniqueKeySet *set;
+    dm_unique_key_t *compound_key;
+    int count;
+
+    // Exit if not a multi-instance object
+    if (node->type != kDMNodeType_Object_MultiInstance)
+    {
+        return;
+    }
+
+    // Exit if there are no unique keys to add
+    unique_keys = &node->registered.object_info.unique_keys;
+    num_sets = unique_keys->num_entries;
+    if (num_sets == 0)
+    {
+        return;
+    }
+
+    // Allocate memory for the unique key sets
+    sor->n_unique_key_sets = num_sets;
+    sor->unique_key_sets = USP_MALLOC(num_sets*sizeof(void *));
+
+    // Iterate over all compound unique keys
+    for (i=0; i < num_sets; i++)
+    {
+        // Add a supported unique key set
+        set = USP_MALLOC(sizeof(Usp__GetSupportedDMResp__SupportedUniqueKeySet));
+        usp__get_supported_dmresp__supported_unique_key_set__init(set);
+        sor->unique_key_sets[i] = set;
+
+        // Count the number of keys in this compound unique key
+        count = 0;
+        compound_key = &unique_keys->vector[i];
+        for (j=0; j<MAX_COMPOUND_KEY_PARAMS; j++)
+        {
+            if (compound_key->param[j] != NULL)
+            {
+                count++;
+            }
+        }
+
+        // Fill in the keys
+        set->n_key_names = count;
+        set->key_names = USP_MALLOC(count*sizeof(char *));
+        count = 0;
+        for (j=0; j<MAX_COMPOUND_KEY_PARAMS; j++)
+        {
+            if (compound_key->param[j] != NULL)
+            {
+                set->key_names[count] = USP_STRDUP(compound_key->param[j]);
+                count++;
+            }
+        }
+    }
 }
 
 /*********************************************************************//**

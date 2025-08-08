@@ -1,6 +1,7 @@
 /*
  *
- * Copyright (C) 2023-2024, Broadband Forum
+ * Copyright (C) 2023-2025, Broadband Forum
+ * Copyright (C) 2024-2025, Vantiva Technologies SAS
  * Copyright (C) 2023-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
@@ -86,4 +87,5 @@ void UDS_ActivateScheduledActions(void);
 bool UDS_AreAllResponsesSent(void);
 void UDS_Destroy(void);
 char *UDS_PathTypeToString(uds_path_t path_type);
+mtp_status_t UDS_GetMtpStatus(int instance);
 #endif // UDS_H

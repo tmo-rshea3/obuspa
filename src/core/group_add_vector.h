@@ -1,6 +1,7 @@
 /*
  *
- * Copyright (C) 2023-2024, Broadband Forum
+ * Copyright (C) 2023-2025, Broadband Forum
+ * Copyright (C) 2024-2025, Vantiva Technologies SAS
  * Copyright (C) 2023-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
@@ -81,5 +82,6 @@ void GROUP_ADD_VECTOR_AddObjectNotCreated(group_add_vector_t *gav, char *req_pat
 int GROUP_ADD_VECTOR_CreateObject(group_add_entry_t *gae, combined_role_t *combined_role);
 group_add_param_t *GROUP_ADD_VECTOR_FindFirstFailedParam(group_add_entry_t *gae);
 void GROUP_ADD_VECTOR_Rollback(group_add_vector_t *gav, int rollback_span);
+void GROUP_ADD_VECTOR_FixupSECacheInstanceNumbers(group_add_vector_t *gav);
 
 #endif
